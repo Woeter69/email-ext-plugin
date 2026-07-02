@@ -11,6 +11,7 @@ import hudson.model.FreeStyleBuild;
 import hudson.plugins.emailext.plugins.trigger.AbortedTrigger;
 import hudson.plugins.emailext.plugins.trigger.FixedTrigger;
 import hudson.plugins.emailext.plugins.trigger.RegressionTrigger;
+import io.jenkins.plugins.casc.ConfigurationAsCode;
 import io.jenkins.plugins.casc.misc.ConfiguredWithCode;
 import io.jenkins.plugins.casc.misc.JenkinsConfiguredWithCodeRule;
 import io.jenkins.plugins.casc.misc.junit.jupiter.WithJenkinsConfiguredWithCode;
@@ -279,5 +280,54 @@ class ExtendedEmailPublisherDescriptorJCasCTest {
         assertDoesNotThrow(() -> new EmailTemplate("valid-template.groovy", "content"));
         assertDoesNotThrow(() -> new EmailTemplate("my_template.jelly", "content"));
         assertDoesNotThrow(() -> new EmailTemplate("report.template", "content"));
+    }
+
+    @Test
+    @ConfiguredWithCode("configuration-as-code-with-templates.yml")
+    void shouldCleanUpRemovedTemplatesButPreserveUserManaged(JenkinsConfiguredWithCodeRule r) throws Exception {
+        File templatesDir = new File(r.jenkins.getRootDir(), "email-templates");
+        assertTrue(templatesDir.exists(), "email-templates directory should exist after initial load");
+
+        // Verify both CasC templates were provisioned
+        File groovyTemplate = new File(templatesDir, "test-template.groovy");
+        File jellyTemplate = new File(templatesDir, "test-jelly-template.jelly");
+        assertTrue(groovyTemplate.exists(), "Groovy template should exist after initial load");
+        assertTrue(jellyTemplate.exists(), "Jelly template should exist after initial load");
+
+        // Verify manifest file was created
+        File manifestFile = new File(templatesDir, ".casc-managed");
+        assertTrue(manifestFile.exists(), "CasC manifest file should exist");
+        List<String> manifest = Files.readAllLines(manifestFile.toPath(), StandardCharsets.UTF_8);
+        assertTrue(manifest.contains("test-template.groovy"), "Manifest should contain groovy template");
+        assertTrue(manifest.contains("test-jelly-template.jelly"), "Manifest should contain jelly template");
+
+        // Place a user-managed template that is NOT managed by CasC
+        File userTemplate = new File(templatesDir, "user-custom.groovy");
+        Files.writeString(userTemplate.toPath(), "// User-managed template content", StandardCharsets.UTF_8);
+        assertTrue(userTemplate.exists(), "User-managed template should exist");
+
+        // Reload with a reduced set of templates (only groovy, no jelly)
+        ConfigurationAsCode.get()
+                .configure(getClass()
+                        .getResource("/configuration-as-code-with-templates-reduced.yml")
+                        .toExternalForm());
+
+        // The groovy template should still exist (it's in both YAML configs)
+        assertTrue(groovyTemplate.exists(), "Groovy template should still exist after reload");
+
+        // The jelly template was removed from the YAML, so it should be cleaned up
+        assertFalse(jellyTemplate.exists(), "Removed CasC template should be deleted on reload");
+
+        // The user-managed template should be preserved
+        assertTrue(userTemplate.exists(), "User-managed template should be preserved on reload");
+        String userContent = Files.readString(userTemplate.toPath(), StandardCharsets.UTF_8);
+        assertEquals("// User-managed template content", userContent, "User-managed template content should be intact");
+
+        // Verify updated manifest only contains the remaining CasC template
+        List<String> updatedManifest = Files.readAllLines(manifestFile.toPath(), StandardCharsets.UTF_8);
+        assertTrue(updatedManifest.contains("test-template.groovy"), "Updated manifest should contain groovy template");
+        assertFalse(
+                updatedManifest.contains("test-jelly-template.jelly"),
+                "Updated manifest should not contain removed jelly template");
     }
 }

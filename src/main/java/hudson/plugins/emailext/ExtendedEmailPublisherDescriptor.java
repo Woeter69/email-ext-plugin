@@ -857,18 +857,26 @@ public final class ExtendedEmailPublisherDescriptor extends BuildStepDescriptor<
         return emailTemplates;
     }
 
+    /** Name of the manifest file that tracks CasC-provisioned templates. */
+    private static final String CASC_MANIFEST_FILE = ".casc-managed";
+
     /**
      * Sets and provisions email templates from Configuration as Code.
      *
      * <p>
      * Each template is validated for security (safe filename, allowed extension,
      * no path traversal) and then written to
-     * {@code $JENKINS_HOME/email-templates/}.
+     * {@code $JENKINS_HOME/email-templates/}. A manifest file
+     * ({@code .casc-managed}) tracks which templates were provisioned by CasC
+     * so that only those are removed on reload, leaving user-managed templates
+     * untouched.
      *
      * @param emailTemplates the list of templates to provision
      */
     @DataBoundSetter
     public void setEmailTemplates(List<EmailTemplate> emailTemplates) {
+        Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+
         this.emailTemplates = emailTemplates != null ? emailTemplates : new ArrayList<>();
 
         File templatesDir = new File(Jenkins.get().getRootDir(), "email-templates");
@@ -877,19 +885,34 @@ public final class ExtendedEmailPublisherDescriptor extends BuildStepDescriptor<
             return;
         }
 
-        // Clean up previously provisioned templates to avoid accumulation of stale/removed templates.
-        // We only delete files that match the expected template extensions to avoid deleting unrelated user files.
-        File[] existingFiles = templatesDir.listFiles(
-                (dir, name) -> name.endsWith(".groovy") || name.endsWith(".jelly") || name.endsWith(".template"));
-
-        if (existingFiles != null) {
-            for (File file : existingFiles) {
-                if (!file.delete()) {
-                    LOGGER.log(Level.WARNING, "Failed to delete old template file: {0}", file.getAbsolutePath());
-                }
+        // Read the previous manifest to find out which files were provisioned by CasC.
+        // Only those files are eligible for cleanup — user-managed templates are left untouched.
+        File manifestFile = new File(templatesDir, CASC_MANIFEST_FILE);
+        List<String> previouslyManaged = new ArrayList<>();
+        if (manifestFile.exists()) {
+            try {
+                previouslyManaged = new ArrayList<>(Files.readAllLines(manifestFile.toPath(), StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to read CasC manifest file", e);
             }
         }
 
+        // Remove only previously CasC-managed template files
+        for (String managedName : previouslyManaged) {
+            if (managedName.isBlank()) {
+                continue;
+            }
+            File managed = new File(templatesDir, managedName);
+            if (managed.exists() && !managed.delete()) {
+                LOGGER.log(
+                        Level.WARNING,
+                        "Failed to delete old CasC-managed template file: {0}",
+                        managed.getAbsolutePath());
+            }
+        }
+
+        // Write the new templates and build the updated manifest
+        List<String> newManifest = new ArrayList<>();
         for (EmailTemplate template : this.emailTemplates) {
             File templateFile = new File(templatesDir, template.getName());
             try {
@@ -906,10 +929,18 @@ public final class ExtendedEmailPublisherDescriptor extends BuildStepDescriptor<
                 }
 
                 Files.writeString(templateFile.toPath(), template.getContent(), StandardCharsets.UTF_8);
+                newManifest.add(template.getName());
                 LOGGER.log(Level.INFO, "Provisioned email template: {0}", template.getName());
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to write email template: " + template.getName(), e);
             }
+        }
+
+        // Persist the manifest so subsequent reloads know which files to clean up
+        try {
+            Files.writeString(manifestFile.toPath(), String.join("\n", newManifest) + "\n", StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to write CasC manifest file", e);
         }
     }
 
@@ -924,9 +955,6 @@ public final class ExtendedEmailPublisherDescriptor extends BuildStepDescriptor<
 
     @Override
     public boolean configure(StaplerRequest2 req, JSONObject formData) throws FormException {
-        if (formData.has("emailTemplates")) {
-            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
-        }
         req.bindJSON(this, formData);
         save();
         return super.configure(req, formData);
